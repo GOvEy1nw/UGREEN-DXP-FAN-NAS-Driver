@@ -46,6 +46,7 @@ jobs:
             ca-certificates \
             curl \
             kmod \
+            python3 \
             xz-utils
 
       - name: Download and extract kernel headers
@@ -105,23 +106,35 @@ jobs:
 
           archive = sys.argv[1]
           output_dir = sys.argv[2]
-          try:
-              tf = tarfile.open(archive, "r:*")
-          except tarfile.TarError as exc:
-              raise SystemExit(f"Unable to read tar archive '{archive}': {exc}") from exc
 
-          safe_members = []
-          with tf:
-              for member in tf.getmembers():
-                  member_path = pathlib.PurePosixPath(member.name)
-                  if member_path.is_absolute() or ".." in member_path.parts:
-                      raise SystemExit(f"Unsafe archive entry path: {member.name}")
-                  if member.issym() or member.islnk():
-                      raise SystemExit(f"Link entries are not allowed in archive: {member.name}")
-                  if not (member.isfile() or member.isdir()):
-                      raise SystemExit(f"Unsupported archive entry type: {member.name}")
-                  safe_members.append(member)
-              tf.extractall(path=output_dir, members=safe_members)
+          # Require the standard-library extraction filter; never silently
+          # fall back to unrestricted extraction on an older Python runtime.
+          if not hasattr(tarfile, "data_filter"):
+              raise SystemExit(
+                  "Safe extraction requires a Python runtime with tarfile.data_filter "
+                  "(Python 3.12+ or a supported backport)."
+              )
+
+          def kernel_member_filter(member, destination):
+              # Keep the existing restriction on archive entry names.
+              member_path = pathlib.PurePosixPath(member.name)
+              if member_path.is_absolute() or ".." in member_path.parts:
+                  raise tarfile.FilterError(f"Unsafe archive entry path: {member.name}")
+
+              # Allow internal symlinks/hardlinks, including relative '../'
+              # link targets that remain inside the extraction directory.
+              # Validate each entry at extraction time so previously created
+              # symlinks are taken into account. Reject absolute/outside links,
+              # path escapes, devices and FIFOs; remove unsafe metadata.
+              return tarfile.data_filter(member, destination)
+
+          try:
+              with tarfile.open(archive, "r:*", errorlevel=2) as tf:
+                  tf.extractall(path=output_dir, filter=kernel_member_filter)
+          except (tarfile.TarError, OSError, ValueError) as exc:
+              raise SystemExit(f"Kernel archive extraction failed: {exc}") from exc
+
+          print("Kernel archive extracted with internal-link safety checks.")
           PY
           }
 
