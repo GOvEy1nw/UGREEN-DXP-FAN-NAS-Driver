@@ -28,7 +28,8 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Keep the runner stable; Ubuntu 24.04 provides gcc-14.
+    runs-on: ubuntu-24.04
     env:
       KERNEL_VERSION: ${{ github.event.inputs.kernel_version }}
       HEADERS_URL: ${{ github.event.inputs.kernel_headers_url }}
@@ -240,39 +241,58 @@ jobs:
             fi
           done
 
-          GCC_MAJOR="$(
-            {
-              sed -n 's/^CONFIG_CC_VERSION_TEXT="\(.*\)"/\1/p' "$KBUILD_DIR/include/config/auto.conf" || true
-              sed -n 's/^#define LINUX_COMPILER "\(.*\)"/\1/p' "$KBUILD_DIR/include/generated/compile.h" || true
-            } | sed -n 's/.*gcc[^0-9]*\([0-9][0-9]*\)\..*/\1/p' | head -n1
-          )"
-
           echo "kbuild_dir=$KBUILD_DIR" >> "$GITHUB_OUTPUT"
           echo "headers_root=$EXTRACTED" >> "$GITHUB_OUTPUT"
-          echo "gcc_major=$GCC_MAJOR" >> "$GITHUB_OUTPUT"
 
       - name: Build it87.ko
+        env:
+          KBUILD_DIR: ${{ steps.headers.outputs.kbuild_dir }}
         run: |
           set -euo pipefail
-          GCC_MAJOR="${{ steps.headers.outputs.gcc_major }}"
-          CC_BIN="gcc"
-          if [ -n "$GCC_MAJOR" ]; then
-            CC_BIN="gcc-$GCC_MAJOR"
-            if ! command -v "$CC_BIN" >/dev/null 2>&1; then
-              sudo apt-get update
-              sudo apt-get install -y --no-install-recommends "$CC_BIN"
-            fi
-          fi
+
+          # Unraid 6.18.38 was built with GCC 14.2.0. Use GCC 14 explicitly;
+          # do not fall back to the runner's unversioned gcc (GCC 13).
+          CC_BIN="gcc-14"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "$CC_BIN"
+
           command -v "$CC_BIN" >/dev/null 2>&1 || {
             echo "Required compiler $CC_BIN is not available on runner." >&2
             exit 1
           }
-          make -C it87 clean || true
-          make -C it87 \
-            CC="$CC_BIN" \
-            TARGET="$KERNEL_VERSION" \
-            KERNEL_BUILD="${{ steps.headers.outputs.kbuild_dir }}" \
-            BUILD="$BUILD_MODE"
+          CC_VERSION="$("$CC_BIN" -dumpfullversion -dumpversion)"
+          if [[ "${CC_VERSION%%.*}" != "14" ]]; then
+            echo "Expected GCC 14, but $CC_BIN reports $CC_VERSION." >&2
+            exit 1
+          fi
+          echo "Selected compiler: $CC_BIN ($CC_VERSION)"
+          "$CC_BIN" --version
+
+          # Verify the exact option that GCC 13 rejected before invoking kbuild.
+          printf 'int compiler_probe(void) { return 0; }\n' | \
+            "$CC_BIN" -Werror -fmin-function-alignment=16 \
+              -x c -c -o /dev/null -
+
+          # Check the archive's actual release, not only the workflow input.
+          HEADER_RELEASE="$(awk -F'"' '/^#define UTS_RELEASE / {print $2}' \
+            "$KBUILD_DIR/include/generated/utsrelease.h")"
+          if [[ "$HEADER_RELEASE" != "$KERNEL_VERSION" ]]; then
+            echo "Kernel mismatch: archive=$HEADER_RELEASE requested=$KERNEL_VERSION" >&2
+            exit 1
+          fi
+
+          # Command-line variables propagate through the driver's recursive make.
+          # The clean step must also target the downloaded Unraid build tree,
+          # rather than whatever kernel happens to be running on GitHub.
+          MAKE_ARGS=(
+            "TARGET=$KERNEL_VERSION"
+            "KERNEL_BUILD=$KBUILD_DIR"
+            "CC=$CC_BIN"
+            "HOSTCC=$CC_BIN"
+            "BUILD=$BUILD_MODE"
+          )
+          make -C it87 "${MAKE_ARGS[@]}" clean
+          make -C it87 "${MAKE_ARGS[@]}"
 
       - name: Collect artifacts
         run: |
@@ -280,6 +300,7 @@ jobs:
           OUT_DIR="$RUNNER_TEMP/artifacts"
           mkdir -p "$OUT_DIR"
           cp it87/it87.ko "$OUT_DIR/"
+          gcc-14 --version > "$OUT_DIR/compiler-version.txt"
           if ! modinfo "$OUT_DIR/it87.ko" > "$OUT_DIR/modinfo.txt" 2>"$OUT_DIR/modinfo.err"; then
             {
               echo "modinfo failed for the produced module."
